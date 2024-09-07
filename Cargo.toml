@@ -11,5 +11,7 @@ futures = "0.3.30"
 libp2p = { version = "0.54.1", features = ["yamux", "tcp", "noise", "mdns", "autonat", "relay", "rendezvous", "upnp", "identify", "ping", "tokio", "macros", "ed25519", "request-response", "json", "cbor"] }
 serde = { version = "1.0.210", features = ["derive", "alloc", "rc"] }
 serde_json = { version = "1.0.128", features = ["alloc"] }
+strum = { version = "0.26.3", features = ["derive"] }
 tokio = { version = "1.40.0", features = ["full", "rt"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+uuid = { version = "1.10.0", features = ["v4", "fast-rng", "serde"] }

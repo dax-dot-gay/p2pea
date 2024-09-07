@@ -1,6 +1,6 @@
-use std::error::Error;
+use std::{any::Any, error::Error, mem::discriminant};
 
-use p2pea::{PeaError, PeerBuilder};
+use p2pea::{events::PeaEventType, PeaError, PeaEvent, PeerBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), PeaError> {

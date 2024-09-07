@@ -18,8 +18,14 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{spawn, task::JoinHandle};
+use uuid::Uuid;
 
-use crate::{commands::PeaCommand, error::PeaResult, events::PeaEvent, PeaError};
+use crate::{
+    commands::PeaCommand,
+    error::PeaResult,
+    events::{PeaEvent, PeaEventType},
+    PeaError,
+};
 
 #[derive(swarm::NetworkBehaviour)]
 pub struct PeaBehavior {
@@ -92,11 +98,33 @@ impl ActivePeer {
         })
     }
 
+    fn emit(&self, event: PeaEventType) -> Result<(), Box<dyn Error>> {
+        let data = PeaEvent {
+            protocol: self.protocol.clone(),
+            version: self.version.clone(),
+            peer: self.identity.public().to_peer_id().to_string(),
+            event,
+        };
+        Ok(self.events.send_blocking(data)?)
+    }
+
     async fn handle_event(
         &mut self,
         event: SwarmEvent<PeaBehaviorEvent>,
     ) -> Result<(), Box<dyn Error>> {
-        println!("EVENT: {event:?}");
+        match event {
+            SwarmEvent::NewListenAddr {
+                listener_id: _,
+                address,
+            } => self.emit(PeaEventType::NewListeningAddress(address.to_string()))?,
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                self.emit(PeaEventType::ExternalAddress(address.to_string()))?
+            }
+            evt => {
+                println!("{:?}", evt);
+                ()
+            }
+        }
         Ok(())
     }
 
@@ -124,6 +152,13 @@ impl ActivePeer {
     }
 }
 
+#[derive(Clone)]
+pub struct PeerEventHandler {
+    pub id: Uuid,
+    pub event: String,
+    pub handler: Arc<dyn Fn(PeaEvent) -> ()>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Builder)]
 #[builder(build_fn(error = "crate::PeaError"))]
 pub struct Peer {
@@ -149,6 +184,10 @@ pub struct Peer {
     #[serde(skip)]
     #[builder(setter(skip))]
     pub handle: Option<Arc<Mutex<JoinHandle<Result<(), String>>>>>,
+
+    #[serde(skip)]
+    #[builder(setter(skip))]
+    pub event_handlers: Arc<Mutex<Vec<PeerEventHandler>>>,
 }
 
 impl PeerBuilder {
@@ -167,8 +206,7 @@ impl PeerBuilder {
 impl Peer {
     pub fn keypair(&self) -> PeaResult<Keypair> {
         Ok(PeaError::wrap(Keypair::from_protobuf_encoding(
-            PeaError::wrap(engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(self.key.clone()))?
+            PeaError::wrap(engine::general_purpose::URL_SAFE_NO_PAD.decode(self.key.clone()))?
                 .as_slice(),
         ))?)
     }
