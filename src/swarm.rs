@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{spawn, task::JoinHandle};
 
-use crate::{commands::PeaCommand, events::PeaEvent};
+use crate::{commands::PeaCommand, error::PeaResult, events::PeaEvent, PeaError};
 
 #[derive(swarm::NetworkBehaviour)]
 pub struct PeaBehavior {
@@ -125,6 +125,7 @@ impl ActivePeer {
 }
 
 #[derive(Serialize, Deserialize, Clone, Builder)]
+#[builder(build_fn(error = "crate::PeaError"))]
 pub struct Peer {
     #[builder(default = "\"p2pea.generic\".to_string()")]
     pub protocol: String,
@@ -164,39 +165,42 @@ impl PeerBuilder {
 }
 
 impl Peer {
-    pub fn keypair(&self) -> Result<Keypair, Box<dyn Error>> {
-        Ok(Keypair::from_protobuf_encoding(
-            engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(self.key.clone())?
+    pub fn keypair(&self) -> PeaResult<Keypair> {
+        Ok(PeaError::wrap(Keypair::from_protobuf_encoding(
+            PeaError::wrap(engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(self.key.clone()))?
                 .as_slice(),
-        )?)
+        ))?)
     }
 
-    pub fn id(&self) -> Result<PeerId, Box<dyn Error>> {
-        Ok(self.keypair()?.public().to_peer_id())
+    pub fn id(&self) -> PeaResult<PeerId> {
+        Ok(PeaError::wrap(self.keypair())?.public().to_peer_id())
     }
 
-    pub fn listen(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn listen(&mut self) -> PeaResult<()> {
+        if self.listening() {
+            return Err(PeaError::Listening);
+        }
         let (com_send, com_recv) = unbounded::<PeaCommand>();
         let (evt_send, evt_recv) = unbounded::<PeaEvent>();
         self.commands = Some(com_send);
         self.events = Some(evt_recv);
-        let mut peer = ActivePeer::new(
+        let mut peer = PeaError::wrap(ActivePeer::new(
             self.protocol.clone(),
             self.version.clone(),
-            self.keypair()?,
+            PeaError::wrap(self.keypair())?,
             self.service_port.clone(),
             evt_send,
             com_recv,
-        )?;
+        ))?;
 
         let handle = spawn(async move { peer.serve().await.or_else(|e| Err(format!("{e:?}"))) });
         self.handle = Some(Arc::new(Mutex::new(handle)));
         Ok(())
     }
 
-    pub fn unlisten(&mut self) -> Result<(), String> {
-        if self.handle.is_some() {
+    pub fn unlisten(&mut self) -> PeaResult<()> {
+        if self.listening() {
             self.commands.clone().unwrap().close();
             self.events.clone().unwrap().close();
             self.commands = None;
@@ -206,7 +210,11 @@ impl Peer {
 
             Ok(())
         } else {
-            Err("Not currently listening".to_string())
+            Err(PeaError::NotListening)
         }
+    }
+
+    pub fn listening(&self) -> bool {
+        self.commands.is_some() && self.events.is_some() && self.handle.is_some()
     }
 }
