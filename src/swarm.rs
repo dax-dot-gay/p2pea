@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    sync::{Arc, Mutex},
+    thread::{spawn, JoinHandle},
 };
 
 use async_channel::{unbounded, Receiver, Sender};
@@ -15,13 +15,11 @@ use libp2p::{
     swarm::{self, SwarmEvent},
     tcp, upnp, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{spawn, task::JoinHandle};
-use uuid::Uuid;
 
 use crate::{
-    commands::PeaCommand,
+    commands::{CommandType, PeaCommand},
     error::PeaResult,
     events::{PeaEvent, PeaEventType},
     PeaError,
@@ -37,7 +35,7 @@ pub struct PeaBehavior {
     request_response: request_response::json::Behaviour<Value, Value>,
 }
 
-pub struct ActivePeer {
+struct Server {
     pub protocol: String,
     pub version: String,
     pub service_port: u16,
@@ -47,7 +45,7 @@ pub struct ActivePeer {
     pub commands: Receiver<PeaCommand>,
 }
 
-impl ActivePeer {
+impl Server {
     pub fn new(
         protocol: String,
         version: String,
@@ -87,7 +85,7 @@ impl ActivePeer {
             })?
             .build();
 
-        Ok(ActivePeer {
+        Ok(Server {
             protocol,
             version,
             identity: key,
@@ -129,7 +127,9 @@ impl ActivePeer {
     }
 
     async fn handle_command(&mut self, command: PeaCommand) -> Result<(), Box<dyn Error>> {
-        Ok(())
+        match command.command {
+            CommandType::ListPeers => command.ok(self.swarm.connected_peers().map(|v| v.to_string()).collect::<Vec<String>>()).await
+        }
     }
 
     pub async fn serve(&mut self) -> Result<(), Box<dyn Error>> {
@@ -151,15 +151,7 @@ impl ActivePeer {
         Ok(())
     }
 }
-
-#[derive(Clone)]
-pub struct PeerEventHandler {
-    pub id: Uuid,
-    pub event: String,
-    pub handler: Arc<dyn Fn(PeaEvent) -> ()>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Builder)]
+#[derive(Serialize, Deserialize, Clone, Builder, Debug)]
 #[builder(build_fn(error = "crate::PeaError"))]
 pub struct Peer {
     #[builder(default = "\"p2pea.generic\".to_string()")]
@@ -172,22 +164,6 @@ pub struct Peer {
         default = "engine::general_purpose::URL_SAFE_NO_PAD.encode(Keypair::generate_ed25519().to_protobuf_encoding().unwrap())"
     )]
     pub key: String,
-
-    #[serde(skip)]
-    #[builder(setter(skip))]
-    pub commands: Option<Sender<PeaCommand>>,
-
-    #[serde(skip)]
-    #[builder(setter(skip))]
-    pub events: Option<Receiver<PeaEvent>>,
-
-    #[serde(skip)]
-    #[builder(setter(skip))]
-    pub handle: Option<Arc<Mutex<JoinHandle<Result<(), String>>>>>,
-
-    #[serde(skip)]
-    #[builder(setter(skip))]
-    pub event_handlers: Arc<Mutex<Vec<PeerEventHandler>>>,
 }
 
 impl PeerBuilder {
@@ -215,44 +191,86 @@ impl Peer {
         Ok(PeaError::wrap(self.keypair())?.public().to_peer_id())
     }
 
-    pub fn listen(&mut self) -> PeaResult<()> {
-        if self.listening() {
-            return Err(PeaError::Listening);
-        }
-        let (com_send, com_recv) = unbounded::<PeaCommand>();
+    pub fn connect(&self) -> ActivePeer {
+        ActivePeer::new(self.clone())
+    }
+}
+
+pub struct ActivePeer {
+    pub peer: Peer,
+    pub events: Receiver<PeaEvent>,
+    pub commands: Sender<PeaCommand>,
+    pub server: JoinHandle<Result<(), PeaError>>,
+}
+
+impl ActivePeer {
+    pub fn new(peer: Peer) -> Self {
         let (evt_send, evt_recv) = unbounded::<PeaEvent>();
-        self.commands = Some(com_send);
-        self.events = Some(evt_recv);
-        let mut peer = PeaError::wrap(ActivePeer::new(
-            self.protocol.clone(),
-            self.version.clone(),
-            PeaError::wrap(self.keypair())?,
-            self.service_port.clone(),
-            evt_send,
-            com_recv,
-        ))?;
+        let (com_send, com_recv) = unbounded::<PeaCommand>();
 
-        let handle = spawn(async move { peer.serve().await.or_else(|e| Err(format!("{e:?}"))) });
-        self.handle = Some(Arc::new(Mutex::new(handle)));
-        Ok(())
-    }
+        let s_peer = peer.clone();
+        let tx = evt_send.clone();
+        let rx = com_recv.clone();
 
-    pub fn unlisten(&mut self) -> PeaResult<()> {
-        if self.listening() {
-            self.commands.clone().unwrap().close();
-            self.events.clone().unwrap().close();
-            self.commands = None;
-            self.events = None;
+        let handle = spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut server = PeaError::wrap(Server::new(
+                        s_peer.protocol.clone(),
+                        s_peer.version.clone(),
+                        s_peer.keypair()?,
+                        s_peer.service_port,
+                        tx,
+                        rx,
+                    ))?;
+                    PeaError::wrap(server.serve().await)
+                })
+        });
 
-            self.handle = None;
-
-            Ok(())
-        } else {
-            Err(PeaError::NotListening)
+        ActivePeer {
+            peer: peer.clone(),
+            events: evt_recv.clone(),
+            commands: com_send.clone(),
+            server: handle
         }
     }
 
-    pub fn listening(&self) -> bool {
-        self.commands.is_some() && self.events.is_some() && self.handle.is_some()
+    pub fn events(&self) -> PeerEventLoop {
+        PeerEventLoop {peer: self.peer.clone(), events: self.events.clone()}
+    }
+
+    pub async fn call<T: Serialize + DeserializeOwned>(&self, command: CommandType) -> PeaResult<T> {
+        let (cmd, recv) = PeaCommand::new(command);
+        PeaError::wrap(self.commands.send(cmd).await)?;
+        
+        match PeaError::wrap(recv.recv().await)? {
+            Ok(v) => PeaError::wrap(serde_json::from_value::<T>(v)),
+            Err(e) => Err(e)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerEventLoop {
+    pub peer: Peer,
+    pub events: Receiver<PeaEvent>,
+}
+
+impl Iterator for PeerEventLoop {
+    type Item = PeaEvent;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.events.recv_blocking() {
+            Ok(event) => Some(event),
+            Err(_) => None
+        }
+    }
+}
+
+impl PeerEventLoop {
+    pub fn try_next(&mut self) -> PeaResult<PeaEvent> {
+        self.events.try_recv().or(Err(PeaError::NoEvents))
     }
 }
