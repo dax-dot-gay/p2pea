@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 pub enum PeaError {
     Generic(String),
     Listening,
-    NotListening
+    NotListening,
+    NoEvents,
+    InvalidAddress(String),
+    InvalidId(String)
 }
 
 impl PeaError {
