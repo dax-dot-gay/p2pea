@@ -7,7 +7,9 @@ pub enum PeaError {
     Generic(String),
     Listening,
     NotListening,
-    NoEvents
+    NoEvents,
+    InvalidAddress(String),
+    InvalidId(String)
 }
 
 impl PeaError {

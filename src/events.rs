@@ -5,7 +5,9 @@ use strum::AsRefStr;
 #[strum(serialize_all = "kebab-case")]
 pub enum PeaEventType {
     NewListeningAddress(String),
-    ExternalAddress(String)
+    ExternalAddress(String),
+    ConnectionOpen{peer: String, id: String, address: String},
+    ConnectionClosed{peer: String, id: String, address: String, reason: Option<String>}
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

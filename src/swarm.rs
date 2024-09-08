@@ -1,6 +1,5 @@
 use std::{
-    error::Error,
-    thread::{spawn, JoinHandle},
+    error::Error, str::FromStr, thread::{spawn, JoinHandle}, time::Duration
 };
 
 use async_channel::{unbounded, Receiver, Sender};
@@ -12,8 +11,8 @@ use libp2p::{
     identity::Keypair,
     mdns, noise, ping,
     request_response::{self, ProtocolSupport},
-    swarm::{self, SwarmEvent},
-    tcp, upnp, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    swarm::{self, DialError, SwarmEvent},
+    tcp, upnp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -83,6 +82,7 @@ impl Server {
                     ),
                 })
             })?
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
             .build();
 
         Ok(Server {
@@ -96,39 +96,96 @@ impl Server {
         })
     }
 
-    fn emit(&self, event: PeaEventType) -> Result<(), Box<dyn Error>> {
+    fn emit(&self, event: PeaEventType) -> () {
         let data = PeaEvent {
             protocol: self.protocol.clone(),
             version: self.version.clone(),
             peer: self.identity.public().to_peer_id().to_string(),
             event,
         };
-        Ok(self.events.send_blocking(data)?)
+        let _ = self.events.send_blocking(data);
     }
 
-    async fn handle_event(
-        &mut self,
-        event: SwarmEvent<PeaBehaviorEvent>,
-    ) -> Result<(), Box<dyn Error>> {
+    async fn handle_event(&mut self, event: SwarmEvent<PeaBehaviorEvent>) -> () {
         match event {
             SwarmEvent::NewListenAddr {
                 listener_id: _,
                 address,
-            } => self.emit(PeaEventType::NewListeningAddress(address.to_string()))?,
+            } => self.emit(PeaEventType::NewListeningAddress(address.to_string())),
             SwarmEvent::ExternalAddrConfirmed { address } => {
-                self.emit(PeaEventType::ExternalAddress(address.to_string()))?
+                self.emit(PeaEventType::ExternalAddress(address.to_string()))
             }
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established: _,
+                concurrent_dial_errors: _,
+                established_in: _,
+            } => self.emit(PeaEventType::ConnectionOpen {
+                peer: peer_id.to_string(),
+                id: connection_id.to_string(),
+                address: endpoint.get_remote_address().to_string(),
+            }),
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established: _,
+                cause
+            } => self.emit(PeaEventType::ConnectionClosed {
+                peer: peer_id.to_string(),
+                id: connection_id.to_string(),
+                address: endpoint.get_remote_address().to_string(),
+                reason: cause.and_then(|e| Some(format!("{e:?}")))
+            }),
             evt => {
                 println!("{:?}", evt);
                 ()
             }
         }
-        Ok(())
     }
 
-    async fn handle_command(&mut self, command: PeaCommand) -> Result<(), Box<dyn Error>> {
-        match command.command {
-            CommandType::ListPeers => command.ok(self.swarm.connected_peers().map(|v| v.to_string()).collect::<Vec<String>>()).await
+    async fn handle_command(&mut self, command: PeaCommand) -> () {
+        match command.clone().command {
+            CommandType::ListPeers => {
+                command
+                    .ok(self
+                        .swarm
+                        .connected_peers()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<String>>())
+                    .await
+            }
+            CommandType::DirectConnect(addr) => {
+                if let Ok(adr) = addr.parse::<Multiaddr>() {
+                    match self.swarm.dial(adr) {
+                        Ok(_) => {
+                            command
+                                .ok(self
+                                    .swarm
+                                    .connected_peers()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<String>>())
+                                .await;
+                        }
+                        Err(e) => {
+                            command
+                                .err(PeaError::wrap::<(), DialError>(Err(e)).unwrap_err())
+                                .await;
+                        }
+                    }
+                    ()
+                } else {
+                    ()
+                }
+            }
+            CommandType::SendData { peer, data } => {
+                match PeerId::from_str(peer.as_str()) {
+                    Ok(id) => command.ok(self.swarm.behaviour_mut().request_response.send_request(&id, data).to_string()).await,
+                    Err(e) => command.err(PeaError::InvalidId(format!("{e:?}"))).await
+                }
+            }
         }
     }
 
@@ -139,9 +196,9 @@ impl Server {
         loop {
             let mut commands = Box::pin(self.commands.clone());
             tokio::select! {
-                event = self.swarm.select_next_some() => self.handle_event(event).await?,
+                event = self.swarm.select_next_some() => self.handle_event(event).await,
                 command = commands.next() => match command {
-                    Some(c) => self.handle_command(c).await?,
+                    Some(c) => self.handle_command(c).await,
                     None => break
                 }
             }
@@ -234,21 +291,27 @@ impl ActivePeer {
             peer: peer.clone(),
             events: evt_recv.clone(),
             commands: com_send.clone(),
-            server: handle
+            server: handle,
         }
     }
 
     pub fn events(&self) -> PeerEventLoop {
-        PeerEventLoop {peer: self.peer.clone(), events: self.events.clone()}
+        PeerEventLoop {
+            peer: self.peer.clone(),
+            events: self.events.clone(),
+        }
     }
 
-    pub async fn call<T: Serialize + DeserializeOwned>(&self, command: CommandType) -> PeaResult<T> {
+    pub async fn call<T: Serialize + DeserializeOwned>(
+        &self,
+        command: CommandType,
+    ) -> PeaResult<T> {
         let (cmd, recv) = PeaCommand::new(command);
         PeaError::wrap(self.commands.send(cmd).await)?;
-        
+
         match PeaError::wrap(recv.recv().await)? {
             Ok(v) => PeaError::wrap(serde_json::from_value::<T>(v)),
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 }
@@ -264,7 +327,7 @@ impl Iterator for PeerEventLoop {
     fn next(&mut self) -> Option<Self::Item> {
         match self.events.recv_blocking() {
             Ok(event) => Some(event),
-            Err(_) => None
+            Err(_) => None,
         }
     }
 }

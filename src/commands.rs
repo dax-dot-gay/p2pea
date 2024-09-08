@@ -1,5 +1,3 @@
-use std::error::Error;
-
 use async_channel::{bounded, Receiver, Sender};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -8,7 +6,9 @@ use crate::{error::PeaResult, PeaError};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandType {
-    ListPeers
+    ListPeers,
+    DirectConnect(String),
+    SendData{peer: String, data: Value}
 }
 
 #[derive(Clone, Debug)]
@@ -23,13 +23,11 @@ impl PeaCommand {
         (PeaCommand {command, channel: send.clone()}, recv)
     }
 
-    pub async fn ok<T: Serialize + DeserializeOwned>(&self, value: T) -> Result<(), Box<dyn Error>> {
+    pub async fn ok<T: Serialize + DeserializeOwned>(&self, value: T) -> () {
         let _ = self.channel.send(PeaError::wrap(serde_json::to_value(value))).await;
-        Ok(())
     }
 
-    pub async fn err(&self, value: PeaError) -> Result<(), Box<dyn Error>> {
+    pub async fn err(&self, value: PeaError) -> () {
         let _ = self.channel.send(Err(value)).await;
-        Ok(())
     }
 }
