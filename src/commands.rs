@@ -8,7 +8,7 @@ use crate::{error::PeaResult, PeaError};
 pub enum CommandType {
     ListPeers,
     DirectConnect(String),
-    SendData{peer: String, data: Value}
+    SendStream{peer: String, data: Vec<u8>}
 }
 
 #[derive(Clone, Debug)]

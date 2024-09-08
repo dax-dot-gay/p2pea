@@ -1,7 +1,7 @@
-use std::{any::Any, error::Error, mem::discriminant};
+use std::str::FromStr;
 
 use libp2p::PeerId;
-use p2pea::{events::PeaEventType, PeaError, PeaEvent, PeerBuilder, CommandType};
+use p2pea::{CommandType, PeaError, PeaEventType, Peer, PeerBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), PeaError> {
@@ -14,9 +14,13 @@ async fn main() -> Result<(), PeaError> {
     }
 
     for event in server.events() {
-        println!("EVENT: {event:?}");
-        for id in server.call::<Vec<String>>(CommandType::ListPeers).await.unwrap() {
-            let _ = server.call::<String>(CommandType::SendData { peer: id, data: serde_json::to_value("ALL HAIL DARK LORD POTATOMAN").unwrap() }).await;
+        match event.event {
+            PeaEventType::ExternalAddress(addr) => println!("External: {addr}"),
+            PeaEventType::DataRecv(data) => println!("Recieved: {:?}", data.as_object::<Peer>()),
+            _ => ()
+        }
+        for p in server.call::<Vec<String>>(CommandType::ListPeers).await.unwrap() {
+            let _ = server.send_data(PeerId::from_str(p.as_str()).unwrap(), peer.clone()).await;
         }
     }
 

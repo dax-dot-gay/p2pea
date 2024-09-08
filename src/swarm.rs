@@ -1,27 +1,29 @@
 use std::{
-    error::Error, str::FromStr, thread::{spawn, JoinHandle}, time::Duration
+    error::Error,
+    str::FromStr,
+    thread::{spawn, JoinHandle},
+    time::Duration,
 };
 
 use async_channel::{unbounded, Receiver, Sender};
 use base64::{engine, Engine};
 use derive_builder::Builder;
-use futures::StreamExt;
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use libp2p::{
     autonat, identify,
     identity::Keypair,
     mdns, noise, ping,
-    request_response::{self, ProtocolSupport},
     swarm::{self, DialError, SwarmEvent},
-    tcp, upnp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    tcp, upnp, yamux, Multiaddr, PeerId, Stream, StreamProtocol, Swarm, SwarmBuilder,
 };
+use libp2p_stream as stream;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::{
     commands::{CommandType, PeaCommand},
     error::PeaResult,
     events::{PeaEvent, PeaEventType},
-    PeaError,
+    PeaError, StreamData,
 };
 
 #[derive(swarm::NetworkBehaviour)]
@@ -31,7 +33,7 @@ pub struct PeaBehavior {
     identify: identify::Behaviour,
     autonat: autonat::Behaviour,
     ping: ping::Behaviour,
-    request_response: request_response::json::Behaviour<Value, Value>,
+    stream: stream::Behaviour,
 }
 
 struct Server {
@@ -42,6 +44,13 @@ struct Server {
     pub swarm: Swarm<PeaBehavior>,
     pub events: Sender<PeaEvent>,
     pub commands: Receiver<PeaCommand>,
+}
+
+const PEA_PROTOCOL: StreamProtocol = StreamProtocol::new("/data");
+
+enum Continue {
+    Yes,
+    No,
 }
 
 impl Server {
@@ -76,13 +85,12 @@ impl Server {
                         autonat::Config::default(),
                     ),
                     ping: ping::Behaviour::default(),
-                    request_response: request_response::json::Behaviour::new(
-                        [(StreamProtocol::new("/pea-json"), ProtocolSupport::Full)],
-                        request_response::Config::default(),
-                    ),
+                    stream: stream::Behaviour::default(),
                 })
             })?
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
+            })
             .build();
 
         Ok(Server {
@@ -106,7 +114,7 @@ impl Server {
         let _ = self.events.send_blocking(data);
     }
 
-    async fn handle_event(&mut self, event: SwarmEvent<PeaBehaviorEvent>) -> () {
+    async fn handle_event(&mut self, event: SwarmEvent<PeaBehaviorEvent>) -> Continue {
         match event {
             SwarmEvent::NewListenAddr {
                 listener_id: _,
@@ -132,21 +140,22 @@ impl Server {
                 connection_id,
                 endpoint,
                 num_established: _,
-                cause
+                cause,
             } => self.emit(PeaEventType::ConnectionClosed {
                 peer: peer_id.to_string(),
                 id: connection_id.to_string(),
                 address: endpoint.get_remote_address().to_string(),
-                reason: cause.and_then(|e| Some(format!("{e:?}")))
+                reason: cause.and_then(|e| Some(format!("{e:?}"))),
             }),
             evt => {
                 println!("{:?}", evt);
                 ()
             }
         }
+        Continue::Yes
     }
 
-    async fn handle_command(&mut self, command: PeaCommand) -> () {
+    async fn handle_command(&mut self, command: PeaCommand) -> Continue {
         match command.clone().command {
             CommandType::ListPeers => {
                 command
@@ -155,7 +164,8 @@ impl Server {
                         .connected_peers()
                         .map(|v| v.to_string())
                         .collect::<Vec<String>>())
-                    .await
+                    .await;
+                Continue::Yes
             }
             CommandType::DirectConnect(addr) => {
                 if let Ok(adr) = addr.parse::<Multiaddr>() {
@@ -175,35 +185,77 @@ impl Server {
                                 .await;
                         }
                     }
-                    ()
+                    Continue::Yes
                 } else {
-                    ()
+                    Continue::Yes
                 }
             }
-            CommandType::SendData { peer, data } => {
+            CommandType::SendStream { peer, data } => {
                 match PeerId::from_str(peer.as_str()) {
-                    Ok(id) => command.ok(self.swarm.behaviour_mut().request_response.send_request(&id, data).to_string()).await,
-                    Err(e) => command.err(PeaError::InvalidId(format!("{e:?}"))).await
+                    Ok(id) => match self
+                        .swarm
+                        .behaviour()
+                        .stream
+                        .new_control()
+                        .open_stream(id, PEA_PROTOCOL)
+                        .await
+                    {
+                        Ok(mut stream) => {
+                            match stream.write_all(data.as_slice()).await {
+                                Ok(v) => command.ok(v).await,
+                                Err(e) => command.err(PeaError::Generic(format!("{e:?}"))).await,
+                            }
+                            let _ = stream.close().await;
+                        },
+                        Err(e) => command.err(PeaError::Generic(format!("{e:?}"))).await,
+                    },
+                    Err(_) => command.err(PeaError::InvalidId(peer.clone())).await,
                 }
+                Continue::Yes
             }
         }
+    }
+
+    async fn handle_stream(&mut self, peer: PeerId, mut stream: Stream) -> Continue {
+        let mut data = Vec::<u8>::new();
+        match stream.read_to_end(&mut data).await {
+            Ok(size) => self.emit(PeaEventType::DataRecv(StreamData::new(peer, data, size))),
+            Err(e) => self.emit(PeaEventType::DataRecvFailure {
+                peer: peer.to_string(),
+                reason: format!("{e:?}"),
+            }),
+        }
+        Continue::Yes
     }
 
     pub async fn serve(&mut self) -> Result<(), Box<dyn Error>> {
         let listener = self
             .swarm
             .listen_on(format!("/ip4/0.0.0.0/tcp/{}", self.service_port).parse()?)?;
+        let mut streams = self
+            .swarm
+            .behaviour()
+            .stream
+            .new_control()
+            .accept(PEA_PROTOCOL)?;
         loop {
             let mut commands = Box::pin(self.commands.clone());
-            tokio::select! {
+            let do_continue = tokio::select! {
                 event = self.swarm.select_next_some() => self.handle_event(event).await,
                 command = commands.next() => match command {
                     Some(c) => self.handle_command(c).await,
-                    None => break
+                    None => Continue::No
+                },
+                stream = streams.next() => match stream {
+                    Some((peer, strm)) => self.handle_stream(peer, strm).await,
+                    None => Continue::No
                 }
+            };
+
+            if let Continue::No = do_continue {
+                break;
             }
         }
-
         self.swarm.remove_listener(listener);
         Ok(())
     }
@@ -313,6 +365,20 @@ impl ActivePeer {
             Ok(v) => PeaError::wrap(serde_json::from_value::<T>(v)),
             Err(e) => Err(e),
         }
+    }
+
+    pub async fn send_data<T: Serialize + DeserializeOwned>(
+        &self,
+        peer: PeerId,
+        data: T,
+    ) -> PeaResult<()> {
+        let serialized = serde_json::to_string(&data).or_else(|e| PeaError::wrap(Err(e)))?;
+        let bytes = serialized.as_bytes().to_vec();
+        self.call::<()>(CommandType::SendStream {
+            peer: peer.to_string(),
+            data: bytes,
+        })
+        .await
     }
 }
 
