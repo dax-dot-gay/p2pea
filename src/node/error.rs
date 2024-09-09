@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientError {
     // Failed to decode user input data
-    DecodingError
+    DecodingError(String)
 }
 
 impl Display for ClientError {
