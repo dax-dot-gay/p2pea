@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientError {
     // Failed to decode user input data
-    DecodingError(String),
+    DecodingError(String)
 }
 
 impl Display for ClientError {
@@ -26,7 +26,13 @@ pub enum ProcessError {
     SyncError,
 
     // Requested resource is inactive
-    ResourceError
+    ResourceError,
+
+    // Unexpected internal value
+    LogicError(String),
+
+    // Closed connection
+    Closed
 }
 
 impl Display for ProcessError {
@@ -43,7 +49,14 @@ impl ProcessError {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum NetworkingError {
-    SwarmCreation(String)
+    // Failure during swarm creation
+    SwarmCreation(String),
+
+    // Failed to initialize network process
+    InitializationError(String),
+
+    // Failed to connect to bootstrap node
+    BootstrapError
 }
 
 impl Display for NetworkingError {
