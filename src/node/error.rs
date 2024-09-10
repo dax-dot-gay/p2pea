@@ -8,7 +8,10 @@ pub enum ClientError {
     DecodingError(String),
 
     // Attempted to operate on non-running node
-    InactiveError
+    InactiveError,
+
+    // Invalid node protocol specified
+    ProtocolError
 }
 
 impl Display for ClientError {
