@@ -7,7 +7,7 @@ use libp2p::{
     identity::Keypair,
     kad, mdns, noise, ping, relay,
     swarm::{self, SwarmEvent},
-    tcp, upnp, yamux, Multiaddr, PeerId, Stream, StreamProtocol, Swarm, SwarmBuilder,
+    tcp, upnp, yamux, Multiaddr, PeerId, Stream, StreamProtocol, Swarm, SwarmBuilder
 };
 use libp2p_stream as stream;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -405,7 +405,10 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
                     .send(sender)
                     .await
             }
-            _ => Ok(()),
+            ev => {
+                println!("{ev:?}");
+                Ok(())
+            },
         }
     }
 
@@ -414,7 +417,12 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
         command: Command,
         swarm: &mut swarm::Swarm<NodeBehavior>,
     ) -> PeaResult<()> {
-        Ok(())
+        match command.kind {
+            CommandType::GetClosePeers => {
+                swarm.behaviour_mut().kad.get_closest_peers(self.peer_id());
+                Ok(())
+            }
+        }
     }
 
     async fn handle_stream(
@@ -501,6 +509,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
                 yamux::Config::default,
             )
             .or(NetworkingError::SwarmCreation("Initial build failure".to_string()).wrap())?
+            .with_dns().or(NetworkingError::SwarmCreation("DNS setup failure".to_string()).wrap())?
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .or(NetworkingError::SwarmCreation("Relay transport setup failure".to_string()).wrap())?
             .with_behaviour(|key, relay| {
@@ -554,6 +563,16 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
     pub fn listen(&self) -> PeaResult<NodeEventListener> {
         if let Some(events) = &self.events {
             Ok(NodeEventListener(events.clone()))
+        } else {
+            ClientError::InactiveError.wrap()
+        }
+    }
+
+    pub async fn invoke(&self, command: CommandType) -> PeaResult<Receiver<PeaResult<Value>>> {
+        if let Some(sender) = &self.commands {
+            let (cmd, recv) = Command::new(command);
+            let _ = sender.send(cmd).await;
+            Ok(recv)
         } else {
             ClientError::InactiveError.wrap()
         }

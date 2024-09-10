@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use p2pea::{BootstrapNode, Node, NodeBuilder};
+use p2pea::{BootstrapNode, Node, NodeBuilder, CommandType};
 use tokio::time::sleep;
 
 #[tokio::main]
@@ -10,8 +10,14 @@ async fn main() {
         .build()
         .unwrap();
     node.start().expect("Failed to start");
+    let listener = node.listen().unwrap();
 
-    for evt in node.listen().expect("Failed to get listener") {
-        println!("{evt:?}");
+    loop {
+        while let Some(evt) = listener.try_next() {
+            println!("{evt:?}");
+        }
+
+        sleep(Duration::from_secs(1)).await;
+        node.invoke(CommandType::GetClosePeers).await.expect("Failed to invoke.");
     }
 }

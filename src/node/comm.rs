@@ -11,7 +11,9 @@ use serde_json::Value;
 use super::{Error, PeaResult, ProcessError};
 
 #[derive(Clone, Debug)]
-pub enum CommandType {}
+pub enum CommandType {
+    GetClosePeers
+}
 
 #[derive(Clone, Debug)]
 pub struct Command {
