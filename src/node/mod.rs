@@ -1,10 +1,9 @@
 use async_channel::{Receiver, Sender};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as b64, Engine};
 use derive_builder::Builder;
-use error::{ClientError, ProcessError};
 use libp2p::{
     autonat, identity::Keypair, mdns, noise, ping, relay, rendezvous, swarm, tcp, upnp, yamux,
-    PeerId, Swarm,
+    PeerId, Swarm, SwarmBuilder,
 };
 use libp2p_stream as stream;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -13,10 +12,12 @@ use std::{
     fmt::Debug,
     sync::{Arc, Mutex, MutexGuard},
     thread::JoinHandle,
+    time::Duration,
+    u64,
 };
 
 pub mod error;
-pub use error::{Error, PeaResult};
+pub use error::{ClientError, Error, NetworkingError, PeaResult, ProcessError};
 
 pub mod comm;
 pub use comm::{Command, CommandType, Event};
@@ -24,12 +25,12 @@ pub use comm::{Command, CommandType, Event};
 #[derive(swarm::NetworkBehaviour)]
 pub struct NodeBehavior {
     rendezvous: rendezvous::client::Behaviour,
-    relay: relay::client::Behaviour,
     ping: ping::Behaviour,
     upnp: upnp::tokio::Behaviour,
     mdns: mdns::tokio::Behaviour,
     autonat: autonat::Behaviour,
     stream: stream::Behaviour,
+    relay: relay::client::Behaviour,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,5 +133,37 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug> Node<T> {
 
     fn thread_handle(&self) -> PeaResult<MutexGuard<Option<JoinHandle<PeaResult<()>>>>> {
         self.handle.lock().or(ProcessError::SyncError.wrap())
+    }
+
+    pub fn start(&self) -> PeaResult<()> {
+        let mut swarm = SwarmBuilder::with_existing_identity(self.key.clone())
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .or(NetworkingError::SwarmCreation("Initial build failure".to_string()).wrap())?
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .or(NetworkingError::SwarmCreation("Relay transport setup failure".to_string()).wrap())?
+            .with_behaviour(|key, relay| {
+                Ok(NodeBehavior {
+                    rendezvous: rendezvous::client::Behaviour::new(key.clone()),
+                    ping: ping::Behaviour::default(),
+                    upnp: upnp::tokio::Behaviour::default(),
+                    mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), self.peer_id())
+                        .unwrap(),
+                    autonat: autonat::Behaviour::new(self.peer_id(), autonat::Config::default()),
+                    stream: stream::Behaviour::default(),
+                    relay,
+                })
+            })
+            .or(NetworkingError::SwarmCreation("Behaviour definition failure".to_string()).wrap())?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
+            })
+            .build();
+
+        Ok(())
     }
 }

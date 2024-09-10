@@ -42,9 +42,27 @@ impl ProcessError {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum NetworkingError {
+    SwarmCreation(String)
+}
+
+impl Display for NetworkingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl NetworkingError {
+    pub fn wrap<T>(&self) -> PeaResult<T> {
+        Err(Error::Network(self.clone()))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Error {
     Client(ClientError),
-    Process(ProcessError)
+    Process(ProcessError),
+    Network(NetworkingError)
 }
 
 impl Display for Error {
