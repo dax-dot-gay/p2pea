@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientError {
     // Failed to decode user input data
-    DecodingError(String)
+    DecodingError(String),
+
+    // Attempted to operate on non-running node
+    InactiveError
 }
 
 impl Display for ClientError {
@@ -32,7 +35,10 @@ pub enum ProcessError {
     LogicError(String),
 
     // Closed connection
-    Closed
+    Closed,
+
+    // Error in communication between main thread & server
+    IPCError
 }
 
 impl Display for ProcessError {

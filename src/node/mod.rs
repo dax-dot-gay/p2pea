@@ -1,9 +1,13 @@
 use async_channel::{unbounded, Receiver, Sender};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as b64, Engine};
 use derive_builder::Builder;
-use futures::{executor::block_on, StreamExt};
+use futures::StreamExt;
 use libp2p::{
-    autonat, identity::Keypair, mdns, noise, ping, relay, rendezvous, swarm::{self, SwarmEvent}, tcp, upnp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder
+    autonat,
+    identity::Keypair,
+    mdns, noise, ping, relay, rendezvous,
+    swarm::{self, SwarmEvent},
+    tcp, upnp, yamux, Multiaddr, PeerId, Stream, StreamProtocol, Swarm, SwarmBuilder,
 };
 use libp2p_stream as stream;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -22,6 +26,8 @@ pub use error::{ClientError, Error, NetworkingError, PeaResult, ProcessError};
 pub mod comm;
 pub use comm::{Command, CommandType, Event};
 
+const PROTOCOL: StreamProtocol = StreamProtocol::new("/pea");
+
 #[derive(swarm::NetworkBehaviour)]
 pub struct NodeBehavior {
     rendezvous: rendezvous::client::Behaviour,
@@ -39,7 +45,33 @@ pub struct NodeInfo {
     pub group: String,
     pub port: u16,
     pub identity: Option<Value>,
-    pub bootstrap_nodes: Vec<String>
+    pub bootstrap_nodes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeEventListener(Receiver<Event>);
+
+impl NodeEventListener {
+    pub fn new(rec: Receiver<Event>) -> Self {
+        NodeEventListener(rec)
+    }
+
+    pub fn try_next(&self) -> Option<Event> {
+        match self.0.try_recv() {
+            Ok(v) => Some(v),
+            Err(_) => None,
+        }
+    }
+}
+
+impl Iterator for NodeEventListener {
+    type Item = Event;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.0.recv_blocking() {
+            Ok(v) => Some(v),
+            Err(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Builder)]
@@ -63,10 +95,10 @@ pub struct Node<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync = 
     swarm: Arc<Mutex<Option<swarm::Swarm<NodeBehavior>>>>,
 
     #[builder(setter(skip))]
-    commands: Arc<Mutex<Option<Sender<Command>>>>,
+    commands: Option<Sender<Command>>,
 
     #[builder(setter(skip))]
-    events: Arc<Mutex<Option<Receiver<Event>>>>,
+    events: Option<Receiver<Event>>,
 
     #[builder(setter(skip))]
     handle: Arc<Mutex<Option<JoinHandle<PeaResult<()>>>>>,
@@ -93,7 +125,6 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
         } else {
             ClientError::DecodingError("Invalid address string".to_string()).wrap()
         }
-        
     }
 }
 
@@ -110,7 +141,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
             identity: self.identity.clone().and_then(|value| {
                 Some(serde_json::to_value(value).expect("Unable to serialize expected value"))
             }),
-            bootstrap_nodes: self.bootstrap_nodes.iter().map(|n| n.to_string()).collect()
+            bootstrap_nodes: self.bootstrap_nodes.iter().map(|n| n.to_string()).collect(),
         }
     }
 
@@ -134,13 +165,17 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
                 }
                 None => None,
             },
-            bootstrap_nodes: info.bootstrap_nodes.iter().filter_map(|n| match n.parse::<Multiaddr>() {
-                Ok(addr) => Some(addr),
-                Err(_) => None
-            }).collect(),
+            bootstrap_nodes: info
+                .bootstrap_nodes
+                .iter()
+                .filter_map(|n| match n.parse::<Multiaddr>() {
+                    Ok(addr) => Some(addr),
+                    Err(_) => None,
+                })
+                .collect(),
             swarm: Arc::new(Mutex::new(None)),
-            commands: Arc::new(Mutex::new(None)),
-            events: Arc::new(Mutex::new(None)),
+            commands: None,
+            events: None,
             handle: Arc::new(Mutex::new(None)),
         })
     }
@@ -157,23 +192,142 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
         self.swarm.lock().or(ProcessError::SyncError.wrap())
     }
 
-    fn commands(&self) -> PeaResult<MutexGuard<Option<Sender<Command>>>> {
-        self.commands.lock().or(ProcessError::SyncError.wrap())
-    }
-
-    fn events(&self) -> PeaResult<MutexGuard<Option<Receiver<Event>>>> {
-        self.events.lock().or(ProcessError::SyncError.wrap())
-    }
-
     fn thread_handle(&self) -> PeaResult<MutexGuard<Option<JoinHandle<PeaResult<()>>>>> {
         self.handle.lock().or(ProcessError::SyncError.wrap())
     }
 
-    async fn handle_event(&self, event: SwarmEvent<NodeBehaviorEvent>, sender: Sender<Event>) -> PeaResult<()> {
+    async fn handle_event(
+        &self,
+        event: SwarmEvent<NodeBehaviorEvent>,
+        sender: Sender<Event>,
+        swarm: &mut swarm::Swarm<NodeBehavior>,
+    ) -> PeaResult<()> {
+        match event {
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } => {
+                Event::Listener(comm::ListenerEvent::NewAddress {
+                    id: listener_id,
+                    address,
+                })
+                .send(sender)
+                .await
+            }
+            SwarmEvent::ExpiredListenAddr {
+                listener_id,
+                address,
+            } => {
+                Event::Listener(comm::ListenerEvent::ExpiredAddress {
+                    id: listener_id,
+                    address,
+                })
+                .send(sender)
+                .await
+            }
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                addresses,
+                reason,
+            } => {
+                Event::Listener(comm::ListenerEvent::Closed {
+                    id: listener_id,
+                    addresses,
+                    reason: match reason {
+                        Ok(_) => None,
+                        Err(e) => Some(e.to_string()),
+                    },
+                })
+                .send(sender)
+                .await
+            }
+            SwarmEvent::ListenerError { listener_id, error } => {
+                Event::Listener(comm::ListenerEvent::Error {
+                    id: listener_id,
+                    reason: error.to_string(),
+                })
+                .send(sender)
+                .await
+            }
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                Event::Address(comm::AddressEvent::Confirmed(address))
+                    .send(sender)
+                    .await
+            }
+            SwarmEvent::ExternalAddrExpired { address } => {
+                Event::Address(comm::AddressEvent::Expired(address))
+                    .send(sender)
+                    .await
+            }
+            SwarmEvent::Dialing {
+                peer_id,
+                connection_id,
+            } => {
+                Event::Network(comm::NetworkEvent::Dialing {
+                    peer_id,
+                    connection_id,
+                })
+                .send(sender)
+                .await
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                concurrent_dial_errors: _,
+                established_in: _,
+            } => {
+                Event::Network(comm::NetworkEvent::ConnectionOpened {
+                    peer_id,
+                    connection_id,
+                    endpoint,
+                    count: num_established,
+                })
+                .send(sender)
+                .await
+            }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                cause,
+            } => {
+                Event::Network(comm::NetworkEvent::ConnectionClosed {
+                    peer_id,
+                    connection_id,
+                    endpoint,
+                    count: num_established,
+                    reason: cause.and_then(|c| Some(c.to_string())),
+                })
+                .send(sender)
+                .await
+            }
+            SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
+                Event::Network(comm::NetworkEvent::PeerAddress { peer_id, address })
+                    .send(sender)
+                    .await
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn handle_command(
+        &self,
+        command: Command,
+        swarm: &mut swarm::Swarm<NodeBehavior>,
+    ) -> PeaResult<()> {
         Ok(())
     }
 
-    async fn handle_command(&self, command: Command) -> PeaResult<()> {
+    async fn handle_stream(
+        &self,
+        peer: PeerId,
+        stream: Stream,
+        sender: Sender<Event>,
+        swarm: &mut swarm::Swarm<NodeBehavior>,
+    ) -> PeaResult<()> {
         Ok(())
     }
 
@@ -183,23 +337,47 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
                 let swarm = swarm_container.as_mut().unwrap();
 
                 for addr in self.bootstrap_nodes.clone() {
-                    swarm.dial(addr).or(NetworkingError::BootstrapError.wrap())?;
+                    swarm
+                        .dial(addr)
+                        .or(NetworkingError::BootstrapError.wrap())?;
                 }
 
                 let mut comm = Box::pin(commands);
-                let listener = swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", self.port).parse::<Multiaddr>().unwrap()).or(NetworkingError::InitializationError("Failed to start listener".to_string()).wrap())?;
+                let mut streams = swarm
+                    .behaviour_mut()
+                    .stream
+                    .new_control()
+                    .accept(PROTOCOL)
+                    .or(NetworkingError::InitializationError(
+                        "Failed to start stream handler".to_string(),
+                    )
+                    .wrap())?;
+                let listener = swarm
+                    .listen_on(
+                        format!("/ip4/0.0.0.0/tcp/{}", self.port)
+                            .parse::<Multiaddr>()
+                            .unwrap(),
+                    )
+                    .or(NetworkingError::InitializationError(
+                        "Failed to start listener".to_string(),
+                    )
+                    .wrap())?;
                 loop {
                     let result = tokio::select! {
-                        event = swarm.select_next_some() => {self.handle_event(event, events.clone()).await},
+                        event = swarm.select_next_some() => {self.handle_event(event, events.clone(), swarm).await},
                         command = comm.next() => {match command {
-                            Some(c) => self.handle_command(c).await,
+                            Some(c) => self.handle_command(c, swarm).await,
                             None => ProcessError::Closed.wrap()
-                        }}
+                        }},
+                        stream = streams.next() => match stream {
+                            Some((peer, strm)) => self.handle_stream(peer, strm, events.clone(), swarm).await,
+                            None => ProcessError::Closed.wrap()
+                        }
                     };
                     if let Err(error) = result {
                         let output = match error {
                             Error::Process(ProcessError::Closed) => Ok(()),
-                            e => Err(e)
+                            e => Err(e),
                         };
                         swarm.remove_listener(listener);
                         return output;
@@ -211,12 +389,9 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
         } else {
             ProcessError::SyncError.wrap()
         }
-        
     }
 
-
-
-    pub fn start(&self) -> PeaResult<()> {
+    pub fn start(&mut self) -> PeaResult<()> {
         let swarm = SwarmBuilder::with_existing_identity(self.key.clone())
             .with_tokio()
             .with_tcp(
@@ -249,13 +424,27 @@ impl<T: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static> No
         let (evt_send, evt_recv) = unbounded::<Event>();
 
         let _ = self.swarm()?.insert(swarm);
-        let _ = self.commands()?.insert(com_send);
-        let _ = self.events()?.insert(evt_recv);
+        self.commands = Some(com_send);
+        self.events = Some(evt_recv);
 
         let cloned = self.clone();
-        let handle = spawn(move || block_on(cloned.run(com_recv, evt_send)));
+        let handle = spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(cloned.run(com_recv.clone(), evt_send.clone()))
+        });
         let _ = self.thread_handle()?.insert(handle);
 
         Ok(())
+    }
+
+    pub fn listen(&self) -> PeaResult<NodeEventListener> {
+        if let Some(events) = &self.events {
+            Ok(NodeEventListener(events.clone()))
+        } else {
+            ClientError::InactiveError.wrap()
+        }
     }
 }
